@@ -10,8 +10,8 @@ if (!SIGNALR_URL || !SIGNALR_USERNAME || !SIGNALR_PASSWORD) {
   throw new Error("SignalR bağlantı bilgileri eksik.");
 }
 
-const GPIO_X = 14;
-const GPIO_Y = 15;
+const GPIO_X = 11;
+const GPIO_Y = 13;
 
 const gpioScript = `
 import sys
