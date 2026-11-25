@@ -1,7 +1,8 @@
 require("dotenv").config();
 
 const signalR = require("@microsoft/signalr");
-const { Gpio } = require("pigpio");
+const { spawn } = require("node:child_process");
+const readline = require("node:readline");
 
 const { SIGNALR_URL, SIGNALR_USERNAME, SIGNALR_PASSWORD } = process.env;
 
@@ -9,37 +10,111 @@ if (!SIGNALR_URL || !SIGNALR_USERNAME || !SIGNALR_PASSWORD) {
   throw new Error("SignalR bağlantı bilgileri eksik.");
 }
 
-// Raspberry Pi GPIO
-const servoX = new Gpio(14, { mode: Gpio.OUTPUT });
-const servoY = new Gpio(15, { mode: Gpio.OUTPUT });
+const GPIO_X = 14;
+const GPIO_Y = 15;
 
-// Açıyı servo PWM sinyaline dönüştür.
-function angleToPulse(angle) {
-  return Math.round(1000 + (angle / 180) * 1000);
-}
+const gpioScript = `
+import sys
+import json
+import lgpio
 
-// Servolara doğrudan yaz.
-function sendToServos(x, y) {
-  try {
-    const finalX = 180 - x;
-    const finalY = y;
+h = lgpio.gpiochip_open(0)
 
-    servoX.servoWrite(angleToPulse(finalX));
-    servoY.servoWrite(angleToPulse(finalY));
+try:
+    lgpio.gpio_claim_output(h, ${GPIO_X})
+    lgpio.gpio_claim_output(h, ${GPIO_Y})
 
-    console.log(`Servo X: ${finalX}° | Servo Y: ${finalY}°`);
+    print("READY", flush=True)
 
-    return true;
-  } catch (error) {
-    console.error("Servo yazma hatası:", error.message);
-    return false;
+    for line in sys.stdin:
+        try:
+            data = json.loads(line)
+
+            x = int(data["x"])
+            y = int(data["y"])
+
+            pulse_x = round(1000 + x / 180 * 1000)
+            pulse_y = round(1000 + y / 180 * 1000)
+
+            result_x = lgpio.tx_servo(h, ${GPIO_X}, pulse_x)
+            result_y = lgpio.tx_servo(h, ${GPIO_Y}, pulse_y)
+
+            if result_x < 0 or result_y < 0:
+                raise RuntimeError("Servo PWM hatası")
+
+            print("OK", flush=True)
+
+        except Exception as error:
+            print("ERROR: " + str(error), flush=True)
+
+finally:
+    lgpio.tx_servo(h, ${GPIO_X}, 0)
+    lgpio.tx_servo(h, ${GPIO_Y}, 0)
+    lgpio.gpiochip_close(h)
+`;
+
+const gpio = spawn("/usr/bin/python3", ["-u", "-c", gpioScript], {
+  stdio: ["pipe", "pipe", "pipe"],
+});
+
+let gpioReady = false;
+let isWriting = false;
+let latestAngles = null;
+
+const lines = readline.createInterface({
+  input: gpio.stdout,
+});
+
+lines.on("line", (message) => {
+  if (message === "READY") {
+    gpioReady = true;
+    console.log("GPIO hazır.");
+    sendToServos();
+    return;
   }
+
+  isWriting = false;
+
+  if (message === "OK") {
+    console.log("Servo komutu uygulandı.");
+  } else {
+    console.error("GPIO:", message);
+  }
+
+  sendToServos();
+});
+
+gpio.stderr.on("data", (data) => {
+  console.error("GPIO hatası:", data.toString());
+});
+
+gpio.on("exit", (code) => {
+  console.error("GPIO işlemi kapandı:", code);
+  process.exit(1);
+});
+
+function sendToServos() {
+  if (!gpioReady || isWriting || latestAngles === null) {
+    return;
+  }
+
+  const { x, y } = latestAngles;
+  latestAngles = null;
+  isWriting = true;
+
+  const finalX = 180 - x;
+  const finalY = y;
+
+  gpio.stdin.write(
+    JSON.stringify({
+      x: finalX,
+      y: finalY,
+    }) + "\n",
+  );
+
+  console.log(`Servo X: ${finalX}° | Servo Y: ${finalY}°`);
 }
 
-// Başlangıç konumu
-sendToServos(90, 90);
-
-// SignalR
 const credentials = Buffer.from(
   `${SIGNALR_USERNAME}:${SIGNALR_PASSWORD}`,
 ).toString("base64");
@@ -69,7 +144,8 @@ connection.on("ReceiveAngles", (data) => {
     return;
   }
 
-  sendToServos(x, y);
+  latestAngles = { x, y };
+  sendToServos();
 });
 
 connection.onreconnecting(() => {
@@ -94,19 +170,19 @@ async function start() {
     await connection.start();
     console.log("SignalR bağlantısı başarılı.");
   } catch (error) {
-    console.error("SignalR bağlantı hatası:", error.message);
+    console.error("SignalR hatası:", error.message);
     setTimeout(start, 5000);
   }
 }
 
-function shutdown() {
-  servoX.servoWrite(0);
-  servoY.servoWrite(0);
-
+process.on("SIGINT", () => {
+  gpio.stdin.end();
   process.exit(0);
-}
+});
 
-process.on("SIGINT", shutdown);
-process.on("SIGTERM", shutdown);
+process.on("SIGTERM", () => {
+  gpio.stdin.end();
+  process.exit(0);
+});
 
 start();
