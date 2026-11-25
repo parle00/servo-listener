@@ -1,114 +1,43 @@
 require("dotenv").config();
 
 const signalR = require("@microsoft/signalr");
-const { SerialPort } = require("serialport");
+const { Gpio } = require("pigpio");
 
-const {
-  SIGNALR_URL,
-  SIGNALR_USERNAME,
-  SIGNALR_PASSWORD,
-  SERIAL_PORT = "/dev/ttyUSB0",
-} = process.env;
+const { SIGNALR_URL, SIGNALR_USERNAME, SIGNALR_PASSWORD } = process.env;
 
 if (!SIGNALR_URL || !SIGNALR_USERNAME || !SIGNALR_PASSWORD) {
   throw new Error("SignalR bağlantı bilgileri eksik.");
 }
 
-// Arduino Serial
-const serialPort = new SerialPort({
-  path: SERIAL_PORT,
-  baudRate: 9600,
-  autoOpen: false,
-});
+// Raspberry Pi GPIO
+const servoX = new Gpio(14, { mode: Gpio.OUTPUT });
+const servoY = new Gpio(15, { mode: Gpio.OUTPUT });
 
-let arduinoReady = false;
-let isWriting = false;
-let latestAngles = null;
-let serialRetryTimer = null;
-
-function openSerial() {
-  if (serialPort.isOpen || serialPort.opening) return;
-
-  serialPort.open((error) => {
-    if (error) {
-      console.error("Arduino bağlantı hatası:", error.message);
-      scheduleSerialReconnect();
-    }
-  });
+// Açıyı servo PWM sinyaline dönüştür.
+function angleToPulse(angle) {
+  return Math.round(1000 + (angle / 180) * 1000);
 }
 
-function scheduleSerialReconnect() {
-  if (serialRetryTimer) return;
+// Servolara doğrudan yaz.
+function sendToServos(x, y) {
+  try {
+    const finalX = 180 - x;
+    const finalY = y;
 
-  serialRetryTimer = setTimeout(() => {
-    serialRetryTimer = null;
-    openSerial();
-  }, 3000);
+    servoX.servoWrite(angleToPulse(finalX));
+    servoY.servoWrite(angleToPulse(finalY));
+
+    console.log(`Servo X: ${finalX}° | Servo Y: ${finalY}°`);
+
+    return true;
+  } catch (error) {
+    console.error("Servo yazma hatası:", error.message);
+    return false;
+  }
 }
 
-serialPort.on("open", () => {
-  console.log("Arduino bağlandı:", SERIAL_PORT);
-
-  // Arduino USB bağlantısında resetlenebilir.
-  setTimeout(() => {
-    if (!serialPort.isOpen) return;
-
-    arduinoReady = true;
-    console.log("Arduino hazır.");
-
-    sendToArduino();
-  }, 2000);
-});
-
-serialPort.on("close", () => {
-  arduinoReady = false;
-  isWriting = false;
-
-  console.log("Arduino bağlantısı kapandı.");
-  scheduleSerialReconnect();
-});
-
-serialPort.on("error", (error) => {
-  console.error("Serial hatası:", error.message);
-});
-
-// Arduino'ya açıları gönder
-function sendToArduino() {
-  if (!arduinoReady || !serialPort.isOpen) return;
-  if (isWriting || latestAngles === null) return;
-
-  const { x, y } = latestAngles;
-  latestAngles = null;
-  isWriting = true;
-  finalX = 180 - x;
-  finalY = y;
-
-  const command = `${finalX},${finalY}\n`;
-
-  serialPort.write(command, (error) => {
-    if (error) {
-      console.error("Serial yazma hatası:", error.message);
-      isWriting = false;
-      return;
-    }
-
-    serialPort.drain((error) => {
-      isWriting = false;
-
-      if (error) {
-        console.error("Serial drain hatası:", error.message);
-        return;
-      }
-
-      console.log("Arduino:", command.trim());
-
-      // Beklerken yeni açı geldiyse sonuncuyu gönder.
-      if (latestAngles !== null) {
-        sendToArduino();
-      }
-    });
-  });
-}
+// Başlangıç konumu
+sendToServos(90, 90);
 
 // SignalR
 const credentials = Buffer.from(
@@ -140,9 +69,7 @@ connection.on("ReceiveAngles", (data) => {
     return;
   }
 
-  latestAngles = { x, y };
-
-  sendToArduino();
+  sendToServos(x, y);
 });
 
 connection.onreconnecting(() => {
@@ -159,6 +86,10 @@ connection.onclose(() => {
 });
 
 async function start() {
+  if (connection.state !== signalR.HubConnectionState.Disconnected) {
+    return;
+  }
+
   try {
     await connection.start();
     console.log("SignalR bağlantısı başarılı.");
@@ -168,5 +99,14 @@ async function start() {
   }
 }
 
-openSerial();
+function shutdown() {
+  servoX.servoWrite(0);
+  servoY.servoWrite(0);
+
+  process.exit(0);
+}
+
+process.on("SIGINT", shutdown);
+process.on("SIGTERM", shutdown);
+
 start();
