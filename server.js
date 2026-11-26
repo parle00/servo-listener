@@ -1,8 +1,8 @@
 require("dotenv").config();
 
+const fs = require("node:fs");
+const path = require("node:path");
 const signalR = require("@microsoft/signalr");
-const { spawn } = require("node:child_process");
-const readline = require("node:readline");
 
 const { SIGNALR_URL, SIGNALR_USERNAME, SIGNALR_PASSWORD } = process.env;
 
@@ -10,109 +10,137 @@ if (!SIGNALR_URL || !SIGNALR_USERNAME || !SIGNALR_PASSWORD) {
   throw new Error("SignalR bağlantı bilgileri eksik.");
 }
 
-const GPIO_X = 12;
-const GPIO_Y = 13;
+// GPIO12 ve GPIO13 donanım PWM pinleridir (PWM kanal 0 ve 1).
+// Yazılım PWM'i (lgpio.tx_servo) Linux zamanlamasına bağlı olduğu için
+// darbeler oynar ve servo titrer. Donanım PWM'inde darbeyi çip üretir.
+// Kurulum (/boot/firmware/config.txt, sonra reboot):
+//   dtoverlay=pwm-2chan,pin=12,func=4,pin2=13,func2=4
+const PWM_CHANNEL_X = 0; // GPIO12
+const PWM_CHANNEL_Y = 1; // GPIO13
 
-const gpioScript = `
-import sys
-import json
-import lgpio
+const PWM_PERIOD_NS = 20_000_000; // 50 Hz
 
-h = lgpio.gpiochip_open(0)
+// Çoğu servo (SG90, MG90S, MG996R) 0-180° için ~500-2500 µs ister;
+// 1000-2000 µs sadece ~90° hareket verir. Uçlarda servo dayanıp
+// vızlıyorsa .env'den daraltın (örn. SERVO_MIN_US=600, SERVO_MAX_US=2400).
+const SERVO_MIN_US = Number(process.env.SERVO_MIN_US ?? 500);
+const SERVO_MAX_US = Number(process.env.SERVO_MAX_US ?? 2500);
 
-try:
-    lgpio.gpio_claim_output(h, ${GPIO_X})
-    lgpio.gpio_claim_output(h, ${GPIO_Y})
+const PWM_SYSFS = "/sys/class/pwm";
 
-    print("READY", flush=True)
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-    for line in sys.stdin:
-        try:
-            data = json.loads(line)
+function findPwmChip() {
+  if (process.env.PWM_CHIP !== undefined) {
+    return path.join(PWM_SYSFS, `pwmchip${process.env.PWM_CHIP}`);
+  }
 
-            x = int(data["x"])
-            y = int(data["y"])
+  const chips = fs.existsSync(PWM_SYSFS)
+    ? fs.readdirSync(PWM_SYSFS).filter((name) => name.startsWith("pwmchip"))
+    : [];
 
-            pulse_x = round(1000 + x / 180 * 1000)
-            pulse_y = round(1000 + y / 180 * 1000)
+  // Pi 5: 1f00098000.pwm | Pi 4: fe20c000.pwm | Pi 3 ve öncesi: 3f20c000.pwm / 2020c000.pwm
+  // (Pi 5'teki fan PWM'i 1f0009c000.pwm'dir, ona dokunmuyoruz.)
+  const chip = chips.find((name) =>
+    /(1f00098000|20c000)\.pwm\//.test(
+      fs.realpathSync(path.join(PWM_SYSFS, name)),
+    ),
+  );
 
-            result_x = lgpio.tx_servo(h, ${GPIO_X}, pulse_x)
-            result_y = lgpio.tx_servo(h, ${GPIO_Y}, pulse_y)
+  if (!chip) {
+    throw new Error(
+      "Donanım PWM bulunamadı. /boot/firmware/config.txt dosyasına " +
+        "'dtoverlay=pwm-2chan,pin=12,func=4,pin2=13,func2=4' ekleyip yeniden başlatın. " +
+        `(Bulunan: ${chips.join(", ") || "yok"})`,
+    );
+  }
 
-            if result_x < 0 or result_y < 0:
-                raise RuntimeError("Servo PWM hatası")
+  return path.join(PWM_SYSFS, chip);
+}
 
-            print("OK", flush=True)
+async function writeWithRetry(file, value) {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      fs.writeFileSync(file, String(value));
+      return;
+    } catch (error) {
+      // export sonrası dosyalar ve udev izinleri birkaç ms gecikebilir.
+      if (attempt >= 20 || !["EACCES", "ENOENT"].includes(error.code)) {
+        throw error;
+      }
+      await sleep(100);
+    }
+  }
+}
 
-        except Exception as error:
-            print("ERROR: " + str(error), flush=True)
+async function setupChannel(chip, channel) {
+  const dir = path.join(chip, `pwm${channel}`);
 
-finally:
-    lgpio.tx_servo(h, ${GPIO_X}, 0)
-    lgpio.tx_servo(h, ${GPIO_Y}, 0)
-    lgpio.gpiochip_close(h)
-`;
+  if (!fs.existsSync(dir)) {
+    fs.writeFileSync(path.join(chip, "export"), String(channel));
+  }
 
-const gpio = spawn("/usr/bin/python3", ["-u", "-c", gpioScript], {
-  stdio: ["pipe", "pipe", "pipe"],
-});
+  const duty = path.join(dir, "duty_cycle");
+  const enable = path.join(dir, "enable");
 
-let gpioReady = false;
-let isWriting = false;
-let latestAngles = null;
+  await writeWithRetry(path.join(dir, "period"), PWM_PERIOD_NS);
+  await writeWithRetry(duty, 0); // ilk açı gelene kadar darbe yok
+  await writeWithRetry(enable, 1);
 
-const lines = readline.createInterface({
-  input: gpio.stdout,
-});
+  return { duty, enable, lastDuty: null };
+}
 
-lines.on("line", (message) => {
-  if (message === "READY") {
-    gpioReady = true;
-    console.log("GPIO hazır.");
-    sendToServos();
+function setServo(servo, angle) {
+  const pulseUs =
+    SERVO_MIN_US + (angle / 180) * (SERVO_MAX_US - SERVO_MIN_US);
+  const duty = Math.round(pulseUs * 1000);
+
+  if (duty === servo.lastDuty) {
+    return false;
+  }
+
+  fs.writeFileSync(servo.duty, String(duty));
+  servo.lastDuty = duty;
+  return true;
+}
+
+function parseAngle(value) {
+  const angle = typeof value === "string" ? Number.parseFloat(value) : value;
+
+  if (typeof angle !== "number" || !Number.isFinite(angle)) {
+    return null;
+  }
+
+  return Math.min(180, Math.max(0, angle));
+}
+
+let servoX = null;
+let servoY = null;
+
+function handleAngles(data) {
+  const x = parseAngle(data?.x ?? data?.X);
+  const y = parseAngle(data?.y ?? data?.Y);
+
+  if (x === null || y === null) {
+    console.error("Geçersiz açı:", data);
     return;
   }
-
-  isWriting = false;
-
-  if (message === "OK") {
-    console.log("Servo komutu uygulandı.");
-  } else {
-    console.error("GPIO:", message);
-  }
-
-  sendToServos();
-});
-
-gpio.stderr.on("data", (data) => {
-  console.error("GPIO hatası:", data.toString());
-});
-
-gpio.on("exit", (code) => {
-  console.error("GPIO işlemi kapandı:", code);
-  process.exit(1);
-});
-
-function sendToServos() {
-  if (!gpioReady || isWriting || latestAngles === null) {
-    return;
-  }
-
-  const { x, y } = latestAngles;
-  latestAngles = null;
-  isWriting = true;
 
   const finalX = 180 - x;
   const finalY = y;
 
-  gpio.stdin.write(
-    JSON.stringify({
-      x: finalX,
-      y: finalY,
-    }) + "\n",
-  );
+  try {
+    const changedX = setServo(servoX, finalX);
+    const changedY = setServo(servoY, finalY);
 
-  console.log(`Servo X: ${finalX}° | Servo Y: ${finalY}°`);
+    if (changedX || changedY) {
+      console.log(
+        `Servo X: ${+finalX.toFixed(1)}° | Servo Y: ${+finalY.toFixed(1)}°`,
+      );
+    }
+  } catch (error) {
+    console.error("PWM yazma hatası:", error.message);
+  }
 }
 
 const credentials = Buffer.from(
@@ -128,25 +156,7 @@ const connection = new signalR.HubConnectionBuilder()
   .withAutomaticReconnect([0, 2000, 5000, 10000])
   .build();
 
-connection.on("ReceiveAngles", (data) => {
-  const x = data?.x ?? data?.X;
-  const y = data?.y ?? data?.Y;
-
-  if (
-    !Number.isInteger(x) ||
-    !Number.isInteger(y) ||
-    x < 0 ||
-    x > 180 ||
-    y < 0 ||
-    y > 180
-  ) {
-    console.error("Geçersiz açı:", data);
-    return;
-  }
-
-  latestAngles = { x, y };
-  sendToServos();
-});
+connection.on("ReceiveAngles", handleAngles);
 
 connection.onreconnecting(() => {
   console.log("SignalR yeniden bağlanıyor...");
@@ -175,14 +185,44 @@ async function start() {
   }
 }
 
-process.on("SIGINT", () => {
-  gpio.stdin.end();
-  process.exit(0);
-});
+function shutdown() {
+  for (const servo of [servoX, servoY]) {
+    if (!servo) continue;
 
-process.on("SIGTERM", () => {
-  gpio.stdin.end();
-  process.exit(0);
-});
+    try {
+      fs.writeFileSync(servo.enable, "0");
+    } catch {
+      // kapanırken hata önemli değil
+    }
+  }
 
-start();
+  process.exit(0);
+}
+
+process.on("SIGINT", shutdown);
+process.on("SIGTERM", shutdown);
+
+async function main() {
+  const chip = findPwmChip();
+
+  servoX = await setupChannel(chip, PWM_CHANNEL_X);
+  servoY = await setupChannel(chip, PWM_CHANNEL_Y);
+
+  console.log(
+    `Donanım PWM hazır (${path.basename(chip)}, ${SERVO_MIN_US}-${SERVO_MAX_US} µs).`,
+  );
+
+  start();
+}
+
+main().catch((error) => {
+  console.error("PWM başlatılamadı:", error.message);
+
+  if (error.code === "EACCES") {
+    console.error(
+      "İzin hatası: kullanıcıyı 'gpio' grubuna ekleyin (sudo usermod -aG gpio $USER) ya da sudo ile çalıştırın.",
+    );
+  }
+
+  process.exit(1);
+});
