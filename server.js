@@ -185,7 +185,13 @@ async function start() {
   }
 }
 
+// Kamera yayını (VDO.Ninja / WebRTC). Ayrı bir alt süreçte çalışır;
+// kamera tarafında hata olsa bile servo kontrolü etkilenmez.
+const camera = require("./camera").start();
+
 function shutdown() {
+  camera.stop();
+
   for (const servo of [servoX, servoY]) {
     if (!servo) continue;
 
