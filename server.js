@@ -129,18 +129,75 @@ function handleAngles(data) {
   const finalX = 180 - x;
   const finalY = y;
 
-  try {
-    const changedX = setServo(servoX, finalX);
-    const changedY = setServo(servoY, finalY);
+  if (finalX === target.x && finalY === target.y) {
+    return;
+  }
 
-    if (changedX || changedY) {
-      console.log(
-        `Servo X: ${+finalX.toFixed(1)}° | Servo Y: ${+finalY.toFixed(1)}°`,
-      );
-    }
+  console.log(
+    `Servo X: ${+finalX.toFixed(1)}° | Servo Y: ${+finalY.toFixed(1)}°`,
+  );
+
+  target.x = finalX;
+  target.y = finalY;
+  startSmoothing();
+}
+
+// Akıcı hareket: açılar internet üzerinden düzensiz aralıklarla geliyor (bazen
+// birkaçı aynı anda, bazen 50-100 ms boşlukla). Her birini anında yazmak bu
+// düzensizliği servoya aynen yansıtıp "tık tık" yürütüyordu. Gelen açı hedef
+// olur; servo hedefe çok kısa bir yumuşatmayla kayarak gider. Duty ns
+// çözünürlüğünde olduğu için ara açılar (ör. 91.37°) de servoya gider, 1°'lik
+// adımlar da kaybolur. Döngü yalnızca servo hareket ederken çalışır.
+const SMOOTH_TICK_MS = 5;
+// Zaman sabiti (ms): hedefe olan farkın ~%63'ü bu sürede kapanır. Gecikmeye
+// yaklaşık bu kadar ekler. Büyütmek daha yumuşak, küçültmek daha çevik yapar.
+// 0 verilirse yumuşatma kapanır, açı geldiği an yazılır.
+const SMOOTH_TAU_MS = Number(process.env.SERVO_SMOOTH_MS ?? 25);
+const SETTLE_DEG = 0.02;
+
+const target = { x: null, y: null };
+const current = { x: null, y: null };
+let smoothTimer = null;
+let lastTickAt = 0;
+
+function approach(from, to, alpha) {
+  if (from === null || SMOOTH_TAU_MS <= 0) return to; // ilk açı: doğrudan git
+  const next = from + (to - from) * alpha;
+  return Math.abs(to - next) < SETTLE_DEG ? to : next;
+}
+
+function writeServos() {
+  try {
+    setServo(servoX, current.x);
+    setServo(servoY, current.y);
   } catch (error) {
     console.error("PWM yazma hatası:", error.message);
   }
+}
+
+function smoothTick() {
+  const now = performance.now();
+  // Gerçek geçen süre kullanılır: zamanlayıcı geç tetiklense de hız aynı kalır.
+  const dt = Math.min(now - lastTickAt, 100);
+  lastTickAt = now;
+
+  const alpha = 1 - Math.exp(-dt / SMOOTH_TAU_MS);
+  current.x = approach(current.x, target.x, alpha);
+  current.y = approach(current.y, target.y, alpha);
+  writeServos();
+
+  if (current.x === target.x && current.y === target.y) {
+    clearInterval(smoothTimer);
+    smoothTimer = null;
+  }
+}
+
+function startSmoothing() {
+  if (!servoX || !servoY || smoothTimer) return;
+  // Yeni hedefe ilk adım beklemeden atılır; geri kalanı döngü tamamlar.
+  lastTickAt = performance.now() - SMOOTH_TICK_MS;
+  smoothTimer = setInterval(smoothTick, SMOOTH_TICK_MS);
+  smoothTick();
 }
 
 const credentials = Buffer.from(
